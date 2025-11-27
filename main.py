@@ -2,11 +2,24 @@ import configparser
 import logging
 import sys
 import time
-import tkinter as tk
-from tkinter import messagebox
 from pathlib import Path
 
 import requests
+
+# --- Environment Detection (GUI vs CLI) ---
+USE_GUI = False
+
+if sys.platform == 'win32':
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        USE_GUI = True
+    except ImportError:
+        USE_GUI = False
+else:
+    # 非 Windows 環境 (Linux/PXE) 直接使用 CLI 模式，避免 import 錯誤
+    USE_GUI = False
+
 
 def get_executable_version() -> str:
     """Reads the version from the executable's properties."""
@@ -94,18 +107,43 @@ def get_mb_sn(file_path: str) -> str | None:
         logging.error(f"Error reading SN file '{file_path}': {e}")
         return None
 
+# --- Error Handling (GUI or CLI) ---
+def show_error_and_exit(message: str):
+    """Displays an error message (GUI box or Console) and exits with a non-zero code."""
+    logging.error(f"Displaying error and exiting: {message}")
+    
+    if USE_GUI:
+        try:
+            root = tk.Tk()
+            root.withdraw() # Hide the main window
+            messagebox.showerror("Connection Failed", message)
+        except Exception as e:
+            logging.error(f"Failed to create GUI window: {e}")
+            print(f"\n[ERROR] {message}\n", file=sys.stderr)
+    else:
+        # 非 Windows 或無 GUI 環境，僅輸出到 Console
+        print(f"\n[ERROR] {message}\n", file=sys.stderr)
+
+    sys.exit(1) # Exit with a non-zero code
+
 # --- Main Application Logic ---
 def main():
     """Main function to run the MES tool.""" # 1. Load configuration
     version = get_executable_version()
     logging.info(f"--- MES Tool Version: {version} ---")
+    
+    if not USE_GUI:
+        logging.info("Running in CLI mode (No GUI).")
+    else:
+        logging.info("Running in GUI mode.")
+
     config = load_config()    
     if not config:
         show_error_and_exit("Failed to load configuration, please check the log.")
     # 1-1. Read Serial Number
     mb_sn = get_mb_sn(config['mb_sn_path'])
     if not mb_sn:
-        show_error_and_exit("Failed to load configuration, please check the log.")
+        show_error_and_exit("Failed to load SN configuration, please check the log.")
 
     # 2. Construct API URL and attempt to connect
     api_url = f"{config['mes_server'].rstrip('/')}/{config['mes_api'].lstrip('/')}{mb_sn}"
@@ -123,7 +161,7 @@ def main():
                 logging.info("Successfully retrieved information from MES (HTTP 200 OK).")
                 try:
                     data = response.json()
-                    logging.info(data)
+                    # logging.info(data) # 視需求開啟詳細 JSON log
                     is_successful = data.get('success') # This will be True, False, or None
                     if is_successful is True:
                         logging.info(f"MES business logic success ('success': {is_successful}).")
@@ -168,13 +206,6 @@ def main():
     logging.info("Tool execution finished.")
     sys.exit(0) # Exit with success code
 
-def show_error_and_exit(message: str):
-    """Displays an error message box and exits with a non-zero code."""
-    logging.error(f"Displaying error and exiting: {message}")
-    root = tk.Tk()
-    root.withdraw() # Hide the main window
-    messagebox.showerror("Connection Failed", message)
-    sys.exit(1) # Exit with a non-zero code
 
 if __name__ == '__main__':
     # We must configure logging before making any calls to the logger.
@@ -185,7 +216,12 @@ if __name__ == '__main__':
     log_path = temp_config.get('Global', 'LOG_PATH', fallback='./log/').strip('"\' ')
 
     log_dir = get_resource_path(log_path)
-    log_dir.mkdir(parents=True, exist_ok=True)  # Ensure log directory exists
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)  # Ensure log directory exists
+    except Exception as e:
+        # Fallback if cannot create log dir (e.g. permission issue)
+        print(f"Warning: Could not create log directory {log_dir}: {e}")
+    
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"debug_{timestamp}.log"
     setup_logging(str(log_file))
