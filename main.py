@@ -3,9 +3,9 @@ import logging
 import sys
 import time
 import json
+import subprocess  # 用於 PowerShell 指令
 from pathlib import Path
-from datetime import datetime  # [NEW] 新增 datetime 引用
-
+from datetime import datetime
 import requests
 
 # --- Environment Detection (GUI vs CLI) ---
@@ -19,7 +19,6 @@ if sys.platform == 'win32':
     except ImportError:
         USE_GUI = False
 else:
-    # 非 Windows 環境 (Linux/PXE) 直接使用 CLI 模式
     USE_GUI = False
 
 
@@ -36,7 +35,6 @@ def get_executable_version() -> str:
 
 # --- Path Handling for PyInstaller ---
 def get_resource_path(relative_path: str) -> Path:
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         base_path = Path(sys.executable).parent
     else:
@@ -82,8 +80,47 @@ def load_config():
         logging.error(f"Missing required option in config file: {e}")
         return None
 
-# --- Serial Number Handling ---
+# --- Serial Number Handling (PowerShell Priority) ---
 def get_mb_sn(file_path: str) -> str | None:
+    """
+    優先嘗試透過 PowerShell 獲取 BaseBoard SN。
+    如果失敗或為空，則降級使用讀取設定檔的方式。
+    """
+    # --- 優先嘗試：使用 PowerShell 獲取 BaseBoard SN ---
+    try:
+        logging.info("Attempting to get SN via PowerShell (Win32_BaseBoard)...")
+        
+        cmd = ["powershell", "-Command", "(Get-WmiObject Win32_BaseBoard).SerialNumber"]
+        
+        startupinfo = None
+        if sys.platform == 'win32':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=5, 
+            startupinfo=startupinfo
+        )
+
+        if result.returncode == 0:
+            p_sn = result.stdout.strip()
+            if p_sn:
+                logging.info(f"Successfully read SN via PowerShell: {p_sn}")
+                return p_sn
+            else:
+                logging.warning("PowerShell returned an empty SN.")
+        else:
+            logging.warning(f"PowerShell command failed with return code: {result.returncode}")
+
+    except Exception as e:
+        logging.warning(f"Failed to get SN via PowerShell: {e}")
+
+    # --- 備案機制：讀取 SN.ini ---
+    logging.info(f"Falling back to reading SN from file: {file_path}")
+    
     sn_path = Path(file_path)
     if not sn_path.is_file():
         logging.error(f"SN file '{file_path}' not found.")
@@ -94,7 +131,7 @@ def get_mb_sn(file_path: str) -> str | None:
         if not sn:
             logging.error(f"SN file '{file_path}' is empty.")
             return None
-        logging.info(f"Successfully read SN: {sn}")
+        logging.info(f"Successfully read SN from file: {sn}")
         return sn
     except Exception as e:
         logging.error(f"Error reading SN file '{file_path}': {e}")
@@ -102,11 +139,6 @@ def get_mb_sn(file_path: str) -> str | None:
 
 # --- Template Processing Logic ---
 def process_mes_template(template_path: Path, mes_data: dict) -> list[str]:
-    """
-    Reads the template, inserts a timestamp at the first line,
-    fills in matching keys from mes_data,
-    and inserts unused keys before the final '##' marker if it exists.
-    """
     lines = []
     
     if template_path.is_file():
@@ -121,13 +153,10 @@ def process_mes_template(template_path: Path, mes_data: dict) -> list[str]:
     remaining_keys = list(mes_data.keys())
     new_content = []
 
-    # [NEW] 1. 產生並插入 Timestamp (格式: YYYY-MM-DD HH:MM:SS.ff)
     now = datetime.now()
-    # strftime('%f') 取得微秒 (如 345678)，取前兩位 [:2] 變成 34
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S") + f".{now.strftime('%f')[:2]}"
-    new_content.append(f"{timestamp_str}\n") # 插入為第一行
+    new_content.append(f"{timestamp_str}\n") 
 
-    # 2. 遍歷模板填入數值
     for line in lines:
         line_stripped = line.strip()
         if not line.endswith('\n'):
@@ -156,17 +185,15 @@ def process_mes_template(template_path: Path, mes_data: dict) -> list[str]:
 
         new_content.append(line)
 
-    # 3. 處理新增的 Key (Template 裡沒有的)
     if remaining_keys:
         new_keys_content = []
         for key in remaining_keys:
             new_keys_content.append(f"##{key}={mes_data[key]}\n")
 
-        # 檢查最後一行是否為 "##" 標記
         if new_content and new_content[-1].strip() == "##":
-            last_line = new_content.pop() # 取出最後一行
-            new_content.extend(new_keys_content) # 加入新 Key
-            new_content.append(last_line) # 放回最後一行
+            last_line = new_content.pop() 
+            new_content.extend(new_keys_content) 
+            new_content.append(last_line) 
         else:
             new_content.extend(new_keys_content)
 
@@ -200,16 +227,22 @@ def main():
     if not config:
         show_error_and_exit("Failed to load configuration.")
 
+    # 1. Get MB SN (PowerShell -> File)
     mb_sn = get_mb_sn(config['mb_sn_path'])
     if not mb_sn:
-        show_error_and_exit("Failed to load SN configuration.")
+        show_error_and_exit("Failed to load SN configuration (PowerShell & File both failed).")
 
     api_url = f"{config['mes_server'].rstrip('/')}/{config['mes_api'].lstrip('/')}{mb_sn}"
     logging.info(f"Preparing to connect to MES API: {api_url}")
 
     response = None
     mes_data_content = None
+    
+    # 變數初始化
+    system_sn = None 
+    mes_station = None 
 
+    # 2. Connect to MES
     for attempt in range(config['retry_count']):
         try:
             logging.info(f"Connection attempt {attempt + 1}/{config['retry_count']}...")
@@ -226,6 +259,21 @@ def main():
                         logging.info(f"MES business logic success ('success': {is_successful}).")
                         
                         data_dict = resp_json.get('data', {})
+
+                        # [Logic 1] Check System SN
+                        system_sn = data_dict.get('system_sn')
+                        if not system_sn:
+                            show_error_and_exit("MES response missing 'system_sn' or value is empty.")
+                        
+                        logging.info(f"Retrieved System SN: {system_sn}")
+
+                        # [Logic 2] Check MES Station (NEW)
+                        mes_station = data_dict.get('mesStation')
+                        if not mes_station:
+                            show_error_and_exit("MES response missing 'mesStation' or value is empty.")
+                        
+                        logging.info(f"Retrieved MES Station: {mes_station}")
+
                         template_path = get_resource_path(config['template_path'])
                         logging.info(f"Processing template: {template_path}")
                         
@@ -254,7 +302,7 @@ def main():
     if mes_data_content is None or response is None:
         show_error_and_exit(f"Could not connect to MES system or retrieve valid data.\nURL: {api_url}")
 
-    # 4-1. Generate PROCESSED file
+    # 4-1. Generate PROCESSED file (MES.txt)
     output_file_path = get_resource_path(config['output_path'])
     try:
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +313,27 @@ def main():
         logging.error(f"Failed to write to file '{output_file_path}': {e}")
         show_error_and_exit(f"Could not write to output file '{output_file_path}'.")
 
-    # 4-2. Generate RAW JSON file
+    # 4-2. Generate SN file (sn.txt)
+    sn_output_path = output_file_path.parent / 'sn.txt'
+    try:
+        with open(sn_output_path, 'w', encoding='utf-8') as f:
+            f.write(str(system_sn))
+        logging.info(f"Successfully wrote System SN to '{sn_output_path}'.")
+    except IOError as e:
+        logging.error(f"Failed to write to SN file '{sn_output_path}': {e}")
+        show_error_and_exit(f"Could not write to SN file '{sn_output_path}'.")
+
+    # 4-3. Generate Station file (station.txt) (NEW)
+    station_output_path = output_file_path.parent / 'station.txt'
+    try:
+        with open(station_output_path, 'w', encoding='utf-8') as f:
+            f.write(str(mes_station))
+        logging.info(f"Successfully wrote Station to '{station_output_path}'.")
+    except IOError as e:
+        logging.error(f"Failed to write to Station file '{station_output_path}': {e}")
+        show_error_and_exit(f"Could not write to Station file '{station_output_path}'.")
+
+    # 4-4. Generate RAW JSON file
     raw_output_path = get_resource_path(config['raw_output_path'])
     try:
         raw_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,4 +369,4 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         logging.warning("Program interrupted by user. Exiting.")
-        sys.exit(130) 
+        sys.exit(130)
