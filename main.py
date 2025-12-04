@@ -261,9 +261,9 @@ def main():
                         data_dict = resp_json.get('data', {})
 
                         # [Logic 1] Check System SN
-                        system_sn = data_dict.get('system_sn')
+                        system_sn = data_dict.get('systemSN')
                         if not system_sn:
-                            show_error_and_exit("MES response missing 'system_sn' or value is empty.")
+                            show_error_and_exit("MES response missing 'systemSN' or value is empty.")
                         
                         logging.info(f"Retrieved System SN: {system_sn}")
 
@@ -370,3 +370,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logging.warning("Program interrupted by user. Exiting.")
         sys.exit(130)
+
